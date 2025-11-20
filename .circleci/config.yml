@@ -1,69 +1,146 @@
 version: 2.1
-EB_APP=$(terraform output -raw eb_app_name)
-EB_ENV=$(terraform output -raw eb_env_name)
-IMAGE_URI=$(terraform output -raw image_uri)
-echo "Creating new application version using image $IMAGE_URI for $EB_APP -> $EB_ENV"
-aws elasticbeanstalk create-application-version --application-name $EB_APP --version-label "$IMAGE_TAG" --source-bundle S3Bucket=$EB_S3_BUCKET,S3Key=dummy || true
-# elastic beanstalk update to use new image requires Dockerrun or platform; real world: you'll upload a Dockerrun.json to S3 or use eb cli
-echo "NOTE: final EB update step may require additional EB-specific steps (upload Dockerrun to S3)"
 
+orbs:
+  python: circleci/python@1.6.0
 
-push-and-deploy-azure:
-docker:
-- image: cimg/base:stable
 parameters:
-image_tag:
-type: string
-default: "latest"
-steps:
-- checkout
-- attach_workspace:
-at: .
-- run:
-name: Login to Azure (service principal)
-command: |
-if [ -z "$AZURE_CLIENT_ID" ] || [ -z "$AZURE_CLIENT_SECRET" ] || [ -z "$AZURE_TENANT_ID" ] || [ -z "$AZURE_SUBSCRIPTION_ID" ]; then
-echo "Azure environment variables missing"; exit 1
-fi
-az login --service-principal -u "$AZURE_CLIENT_ID" -p "$AZURE_CLIENT_SECRET" --tenant "$AZURE_TENANT_ID"
-az account set --subscription "$AZURE_SUBSCRIPTION_ID"
-- run:
-name: Push to ACR
-command: |
-chmod +x ./scripts/push_to_acr.sh
-./scripts/push_to_acr.sh ${IMAGE_TAG}
-- run:
-name: Terraform apply for Azure
-command: |
-cd terraform/azure
-terraform init -input=false
-terraform apply -auto-approve -var="image_tag=${IMAGE_TAG}"
-- run:
-name: Update Web App to use new image
-command: |
-cd terraform/azure
-WEBAPP=$(terraform output -raw webapp_name)
-ACR_NAME=$(terraform output -raw acr_name)
-IMAGE_NAME=$(terraform output -raw image_name)
-FULL_IMAGE=${ACR_NAME}.azurecr.io/${IMAGE_NAME}:${IMAGE_TAG}
-az webapp config container set --name $WEBAPP --resource-group $(terraform output -raw resource_group) --docker-custom-image-name $FULL_IMAGE
+  deploy_target:
+    type: enum
+    enum: [aws, azure]
+    default: aws
 
+jobs:
+  build-and-test:
+    docker:
+      - image: cimg/python:3.11
+    steps:
+      - checkout
+      - python/install-packages:
+          packages: 'pip'
+      - run:
+          name: Install test deps
+          command: |
+            python -m pip install --upgrade pip
+            pip install -r app/requirements.txt
+      - run:
+          name: Run tests
+          command: |
+            pytest -q
+      - setup_remote_docker
+      - run:
+          name: Build Docker image
+          command: |
+            IMAGE_TAG=${IMAGE_TAG:-${CIRCLE_BUILD_NUM:-latest}}
+            IMAGE_NAME=${CIRCLE_PROJECT_REPONAME:-multi-cloud-app}
+            echo "IMAGE_NAME=$IMAGE_NAME" > image_env.txt
+            docker build -t $IMAGE_NAME:$IMAGE_TAG app/
+      - persist_to_workspace:
+          root: .
+          paths:
+            - image_env.txt
+            - .
+
+  push-and-deploy-aws:
+    docker:
+      - image: cimg/base:stable
+    parameters:
+      image_tag:
+        type: string
+        default: "latest"
+    steps:
+      - checkout
+      - attach_workspace:
+          at: .
+      - run:
+          name: Configure AWS credentials
+          command: |
+            python - <<'PY'
+import os,sys
+for v in ['AWS_ACCESS_KEY_ID','AWS_SECRET_ACCESS_KEY','AWS_DEFAULT_REGION']:
+    if v not in os.environ:
+        print('Missing env', v)
+        sys.exit(1)
+print('AWS credentials present')
+PY
+      - run:
+          name: Login to ECR, create repo (if missing) and push
+          command: |
+            chmod +x ./scripts/push_to_ecr.sh
+            ./scripts/push_to_ecr.sh ${IMAGE_TAG}
+      - run:
+          name: Terraform apply for AWS (create EB / ECR etc)
+          command: |
+            cd terraform/aws
+            terraform init -input=false
+            terraform apply -auto-approve -var="image_tag=${IMAGE_TAG}"
+      - run:
+          name: Deploy to Elastic Beanstalk using image
+          command: |
+            # This example assumes the terraform output gives us EB application + env names
+            cd terraform/aws
+            EB_APP=$(terraform output -raw eb_app_name)
+            EB_ENV=$(terraform output -raw eb_env_name)
+            IMAGE_URI=$(terraform output -raw image_uri)
+            echo "Creating new application version using image $IMAGE_URI for $EB_APP -> $EB_ENV"
+            aws elasticbeanstalk create-application-version --application-name $EB_APP --version-label "$IMAGE_TAG" --source-bundle S3Bucket=$EB_S3_BUCKET,S3Key=dummy || true
+            # elastic beanstalk update to use new image requires Dockerrun or platform; real world: you'll upload a Dockerrun.json to S3 or use eb cli
+            echo "NOTE: final EB update step may require additional EB-specific steps (upload Dockerrun to S3)"
+
+  push-and-deploy-azure:
+    docker:
+      - image: cimg/base:stable
+    parameters:
+      image_tag:
+        type: string
+        default: "latest"
+    steps:
+      - checkout
+      - attach_workspace:
+          at: .
+      - run:
+          name: Login to Azure (service principal)
+          command: |
+            if [ -z "$AZURE_CLIENT_ID" ] || [ -z "$AZURE_CLIENT_SECRET" ] || [ -z "$AZURE_TENANT_ID" ] || [ -z "$AZURE_SUBSCRIPTION_ID" ]; then
+              echo "Azure environment variables missing"; exit 1
+            fi
+            az login --service-principal -u "$AZURE_CLIENT_ID" -p "$AZURE_CLIENT_SECRET" --tenant "$AZURE_TENANT_ID"
+            az account set --subscription "$AZURE_SUBSCRIPTION_ID"
+      - run:
+          name: Push to ACR
+          command: |
+            chmod +x ./scripts/push_to_acr.sh
+            ./scripts/push_to_acr.sh ${IMAGE_TAG}
+      - run:
+          name: Terraform apply for Azure
+          command: |
+            cd terraform/azure
+            terraform init -input=false
+            terraform apply -auto-approve -var="image_tag=${IMAGE_TAG}"
+      - run:
+          name: Update Web App to use new image
+          command: |
+            cd terraform/azure
+            WEBAPP=$(terraform output -raw webapp_name)
+            ACR_NAME=$(terraform output -raw acr_name)
+            IMAGE_NAME=$(terraform output -raw image_name)
+            FULL_IMAGE=${ACR_NAME}.azurecr.io/${IMAGE_NAME}:${IMAGE_TAG}
+            az webapp config container set --name $WEBAPP --resource-group $(terraform output -raw resource_group) --docker-custom-image-name $FULL_IMAGE
 
 workflows:
-build-deploy:
-jobs:
-- build-and-test
-- push-and-deploy-aws:
-requires:
-- build-and-test
-image_tag: << pipeline.parameters.IMAGE_TAG >>
-filters:
-branches:
-only: main
-- push-and-deploy-azure:
-requires:
-- build-and-test
-image_tag: << pipeline.parameters.IMAGE_TAG >>
-filters:
-branches:
-only: main
+  build-deploy:
+    jobs:
+      - build-and-test
+      - push-and-deploy-aws:
+          requires:
+            - build-and-test
+          image_tag: << pipeline.parameters.IMAGE_TAG >>
+          filters:
+            branches:
+              only: main
+      - push-and-deploy-azure:
+          requires:
+            - build-and-test
+          image_tag: << pipeline.parameters.IMAGE_TAG >>
+          filters:
+            branches:
+              only: main
