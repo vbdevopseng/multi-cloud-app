@@ -4,10 +4,9 @@ orbs:
   python: circleci/python@1.6.0
 
 parameters:
-  deploy_target:
-    type: enum
-    enum: [aws, azure]
-    default: aws
+  image_tag:
+    type: string
+    default: "latest"
 
 jobs:
   build-and-test:
@@ -43,10 +42,6 @@ jobs:
   push-and-deploy-aws:
     docker:
       - image: cimg/base:stable
-    parameters:
-      image_tag:
-        type: string
-        default: "latest"
     steps:
       - checkout
       - attach_workspace:
@@ -55,44 +50,29 @@ jobs:
           name: Configure AWS credentials
           command: |
             python - <<'PY'
-import os,sys
-for v in ['AWS_ACCESS_KEY_ID','AWS_SECRET_ACCESS_KEY','AWS_DEFAULT_REGION']:
-    if v not in os.environ:
-        print('Missing env', v)
-        sys.exit(1)
-print('AWS credentials present')
-PY
+            import os,sys
+            for v in ['AWS_ACCESS_KEY_ID','AWS_SECRET_ACCESS_KEY','AWS_DEFAULT_REGION']:
+            if v not in os.environ:
+            print('Missing env', v)
+            sys.exit(1)
+            print('AWS credentials present')
+            PY
+
       - run:
-          name: Login to ECR, create repo (if missing) and push
+          name: Login to ECR and push image
           command: |
             chmod +x ./scripts/push_to_ecr.sh
             ./scripts/push_to_ecr.sh ${IMAGE_TAG}
       - run:
-          name: Terraform apply for AWS (create EB / ECR etc)
+          name: Terraform apply for AWS (ECR + ECS Fargate)
           command: |
             cd terraform/aws
             terraform init -input=false
             terraform apply -auto-approve -var="image_tag=${IMAGE_TAG}"
-      - run:
-          name: Deploy to Elastic Beanstalk using image
-          command: |
-            # This example assumes the terraform output gives us EB application + env names
-            cd terraform/aws
-            EB_APP=$(terraform output -raw eb_app_name)
-            EB_ENV=$(terraform output -raw eb_env_name)
-            IMAGE_URI=$(terraform output -raw image_uri)
-            echo "Creating new application version using image $IMAGE_URI for $EB_APP -> $EB_ENV"
-            aws elasticbeanstalk create-application-version --application-name $EB_APP --version-label "$IMAGE_TAG" --source-bundle S3Bucket=$EB_S3_BUCKET,S3Key=dummy || true
-            # elastic beanstalk update to use new image requires Dockerrun or platform; real world: you'll upload a Dockerrun.json to S3 or use eb cli
-            echo "NOTE: final EB update step may require additional EB-specific steps (upload Dockerrun to S3)"
 
   push-and-deploy-azure:
     docker:
       - image: cimg/base:stable
-    parameters:
-      image_tag:
-        type: string
-        default: "latest"
     steps:
       - checkout
       - attach_workspace:
@@ -133,14 +113,12 @@ workflows:
       - push-and-deploy-aws:
           requires:
             - build-and-test
-          image_tag: << pipeline.parameters.IMAGE_TAG >>
           filters:
             branches:
               only: main
       - push-and-deploy-azure:
           requires:
             - build-and-test
-          image_tag: << pipeline.parameters.IMAGE_TAG >>
           filters:
             branches:
               only: main
